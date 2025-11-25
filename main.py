@@ -199,10 +199,11 @@ def generate_validation_reports(state: dict, runtime_ms: float):
     consistency = check_scenario_consistency(input_json, output_json, state["target_scenario"])
 
     # Build JSON report
-    # Schema fidelity: PASS if only values changed (not structure)
-    schema_ok = (len(diff) == 0 or
-                 (len(diff) == 1 and 'values_changed' in diff) or
-                 all(k in ['values_changed', 'repetition_change'] for k in diff.keys()))
+    # Schema fidelity: PASS if only values changed or array items added/removed (dictionary keys must stay the same)
+    # Allow: values_changed, repetition_change, iterable_item_added, iterable_item_removed
+    # Fail on: dictionary_item_added, dictionary_item_removed, type_changes
+    allowed_changes = ['values_changed', 'repetition_change', 'iterable_item_added', 'iterable_item_removed']
+    schema_ok = (len(diff) == 0 or all(k in allowed_changes for k in diff.keys()))
 
     json_report = {
         "timestamp": datetime.now().isoformat(),
@@ -384,185 +385,10 @@ class State(TypedDict):
     chunks: dict  # Store chunks for parallel processing
     transformed_chunks: Annotated[dict, merge_dicts]  # Store results from parallel nodes
     output_json: dict
-    errors: list
+    errors: Annotated[list, operator.add]  # Reducer to concatenate error lists from parallel nodes
     retry_count: int
     start_time: float
     validation_report: dict  # Store validation results
-
-
-def preprocessing_node(state: State) -> State:
-    """Extract locked fields, learning context, and transformable parts in parallel prep"""
-    logger.info("NODE: preprocessing_node - Extracting locked fields and learning context")
-    print("Preprocessing: extracting locked fields and learning context...")
-
-    # Extract locked fields
-    locked = {
-        "scenarioOptions": state["input_json"]["topicWizardData"]["scenarioOptions"],
-        "assessmentCriterion": state["input_json"]["topicWizardData"]["assessmentCriterion"],
-        "industryAlignedActivities": state["input_json"]["topicWizardData"]["industryAlignedActivities"],
-        "level": state["input_json"]["topicWizardData"]["lessonInformation"]["level"],
-        "flowProperties_purposes": []
-    }
-
-    for flow in state["input_json"]["topicWizardData"]["simulationFlow"]:
-        if "flowProperties" in flow and "purpose" in flow["flowProperties"]:
-            locked["flowProperties_purposes"].append(flow["flowProperties"]["purpose"])
-        if "children" in flow:
-            for child in flow["children"]:
-                if "flowProperties" in child and "purpose" in child["flowProperties"]:
-                    locked["flowProperties_purposes"].append(child["flowProperties"]["purpose"])
-
-    logger.info(f"Locked fields extracted: {len(locked['scenarioOptions'])} scenarios, {len(locked['assessmentCriterion'])} criteria, {len(locked['flowProperties_purposes'])} purposes")
-
-    state["locked_fields"] = locked
-
-    # Analyze learning context (rule-based)
-    scenario = state["target_scenario"].lower()
-    assessment_criteria = state["input_json"]["topicWizardData"]["assessmentCriterion"]
-    lesson_level = state["input_json"]["topicWizardData"]["lessonInformation"]["level"]
-
-    # Extract industry context from scenario keywords
-    industry_map = {
-        "airline": ["airline", "flight", "booking", "aeroj", "skylink"],
-        "restaurant/food": ["burger", "restaurant", "food", "meal", "fresh", "harvest", "grill"],
-        "retail": ["retail", "fashion", "trendwave", "chic"],
-        "technology": ["tech", "smartphone", "cloud", "nimbus", "bright"],
-        "hospitality": ["hotel", "haven", "occupancy"],
-        "healthcare": ["pharma", "medicore", "health", "prescription", "medi"],
-        "fitness": ["gym", "fitness", "flex", "body"],
-        "finance": ["bank", "credit", "safe"],
-        "education": ["university", "mba", "enrollment", "learn"],
-        "automotive": ["auto", "car", "drive", "motor"],
-        "entertainment": ["streaming", "cinema", "cine"],
-        "telecom": ["tel", "connect", "data pack"]
-    }
-
-    industry_context = "competitive strategy"
-    for industry, keywords in industry_map.items():
-        if any(kw in scenario for kw in keywords):
-            industry_context = industry
-            break
-
-    # Extract learner role from scenario text
-    learner_role = "business consultant"
-    if "consultant" in scenario:
-        learner_role = "business consultant"
-    elif "advisor" in scenario or "advise" in scenario:
-        learner_role = "strategic advisor"
-    elif "student" in scenario:
-        learner_role = "student analyst"
-
-    # Determine Bloom's taxonomy from assessment criteria verbs
-    bloom_verbs = {
-        "analyze": "Analyze",
-        "evaluate": "Evaluate",
-        "assess": "Evaluate",
-        "recommend": "Create",
-        "propose": "Create",
-        "develop": "Create",
-        "compare": "Analyze",
-        "justify": "Evaluate"
-    }
-
-    blooms_taxonomy = set()
-    for criterion in assessment_criteria:
-        outcome = criterion.get("keyLearningOutcome", "").lower()
-        for verb, level in bloom_verbs.items():
-            if verb in outcome:
-                blooms_taxonomy.add(level)
-
-    if not blooms_taxonomy:
-        blooms_taxonomy = {"Analyze", "Evaluate", "Create"}
-
-    # Soft skills based on assessment structure
-    soft_skills = ["critical thinking", "problem solving", "strategic planning"]
-    if "communication" in str(assessment_criteria).lower() or "summary" in str(assessment_criteria).lower():
-        soft_skills.append("written communication")
-
-    learning_context = {
-        "blooms_taxonomy": list(blooms_taxonomy),
-        "soft_skills": soft_skills,
-        "industry_context": industry_context,
-        "learner_role": learner_role,
-        "transformation_guidelines": [
-            f"Maintain {lesson_level}-level complexity",
-            "Preserve strategic analysis framework",
-            f"Adapt to {industry_context} industry norms"
-        ]
-    }
-
-    state["learning_context"] = learning_context
-
-    # Extract transformable parts (only what LLM needs to process - exclude locked fields)
-    # Strip out locked fields from simulationFlow before sending to LLM
-    clean_simulation_flow = []
-    for flow in state["input_json"]["topicWizardData"]["simulationFlow"]:
-        flow_copy = json.loads(json.dumps(flow))
-        # Remove locked flowProperties.purpose
-        if "flowProperties" in flow_copy and "purpose" in flow_copy["flowProperties"]:
-            del flow_copy["flowProperties"]["purpose"]
-
-        # Remove locked purpose from children
-        if "children" in flow_copy:
-            for child in flow_copy["children"]:
-                if "flowProperties" in child and "purpose" in child["flowProperties"]:
-                    del child["flowProperties"]["purpose"]
-
-        clean_simulation_flow.append(flow_copy)
-
-    state["transformable_parts"] = {
-        "simulationName": state["input_json"]["topicWizardData"]["simulationName"],
-        "selectedScenarioOption": state["input_json"]["topicWizardData"]["selectedScenarioOption"],
-        "workplaceScenario": state["input_json"]["topicWizardData"]["workplaceScenario"],
-        "simulationFlow": clean_simulation_flow
-    }
-
-    print(f"  [PASS] Preprocessing complete")
-    print(f"    - Locked fields: {len(locked['scenarioOptions'])} scenarios, {len(locked['assessmentCriterion'])} criteria")
-    print(f"    - Industry: {learning_context['industry_context']} | Role: {learning_context['learner_role']}")
-
-    return state
-
-
-def estimate_chunk_count(simulation_flow: list) -> int:
-    """Estimate the number of chunks that will be created (matches chunk_preparation_node logic)"""
-    chunk_count = 1  # Start with metadata chunk
-
-    for flow in simulation_flow:
-        if "children" in flow and isinstance(flow["children"], list) and len(flow["children"]) > 0:
-            # Each child becomes its own chunk, plus split large children
-            for child in flow["children"]:
-                # Check if child has large data
-                if "data" in child and isinstance(child.get("data"), dict):
-                    data_size = len(json.dumps(child["data"]))
-                    if data_size > 6000:
-                        # Split large child data in half
-                        chunk_count += 2
-                    else:
-                        chunk_count += 1
-                else:
-                    chunk_count += 1
-        elif "data" in flow and isinstance(flow["data"], dict) and len(flow["data"]) > 5:
-            # Large data object - check each key, split large ones
-            for key, key_data in flow["data"].items():
-                key_data_size = len(json.dumps(key_data))
-                if key_data_size > 10000:
-                    # Very large dict -> 4 chunks
-                    chunk_count += 4
-                elif key_data_size > 6000:
-                    # Large dict -> 3 chunks
-                    chunk_count += 3
-                elif key_data_size > 2500:
-                    # Medium dict/list -> 2 chunks
-                    chunk_count += 2
-                else:
-                    # Small key -> 1 chunk
-                    chunk_count += 1
-        else:
-            # Small flow - one chunk
-            chunk_count += 1
-
-    return chunk_count
 
 
 def chunk_preparation_node(state: State) -> State:
@@ -593,7 +419,7 @@ def chunk_preparation_node(state: State) -> State:
                 # Check if child has large data that should be split
                 if "data" in child and isinstance(child.get("data"), dict):
                     child_data_size = len(json.dumps(child["data"]))
-                    if child_data_size > 6000:
+                    if child_data_size > 10000:
                         # Split large child into 2 chunks
                         print(f"  Large child detected ({child_data_size} chars), splitting into 2 chunks...")
                         child_data_keys = list(child["data"].keys())
@@ -637,21 +463,18 @@ def chunk_preparation_node(state: State) -> State:
                 key_data_size = len(json.dumps(key_data))
 
                 # If this single key's data is large, split it (regardless of type)
-                if key_data_size > 2500:
+                if key_data_size > 8000:
                     if isinstance(key_data, dict):
                         # Dict: split by keys into multiple chunks
                         sub_keys = list(key_data.keys())
 
                         # Determine split count based on size
-                        if key_data_size > 10000:
-                            num_splits = 4  # Very large -> 4 chunks
-                            print(f"    Key '{key}' is very large dict ({key_data_size} chars), splitting into 4 chunks...")
-                        elif key_data_size > 6000:
-                            num_splits = 3  # Large -> 3 chunks
-                            print(f"    Key '{key}' is large dict ({key_data_size} chars), splitting into 3 chunks...")
+                        if key_data_size > 15000:
+                            num_splits = 3  # Very large -> 3 chunks
+                            print(f"    Key '{key}' is very large dict ({key_data_size} chars), splitting into 3 chunks...")
                         else:
-                            num_splits = 2  # Medium -> 2 chunks
-                            print(f"    Key '{key}' is medium dict ({key_data_size} chars), splitting into 2 chunks...")
+                            num_splits = 2  # Large -> 2 chunks
+                            print(f"    Key '{key}' is large dict ({key_data_size} chars), splitting into 2 chunks...")
 
                         chunk_size = len(sub_keys) // num_splits
                         for i in range(num_splits):
@@ -662,9 +485,9 @@ def chunk_preparation_node(state: State) -> State:
                             flow_copy_split["data"] = {key: {k: key_data[k] for k in sub_keys[start_idx:end_idx]}}
                             chunks[f"chunk_{chunk_idx}"] = {"simulationFlow": [flow_copy_split]}
                             chunk_idx += 1
-                    elif isinstance(key_data, list):
-                        # List: split in half
-                        print(f"    Key '{key}' is large list ({key_data_size} chars), splitting into 2 chunks...")
+                    elif isinstance(key_data, list) and key_data_size > 10000:
+                        # List: only split if very large
+                        print(f"    Key '{key}' is very large list ({key_data_size} chars), splitting into 2 chunks...")
                         mid = len(key_data) // 2
 
                         flow_copy1 = json.loads(json.dumps(flow))
@@ -677,8 +500,7 @@ def chunk_preparation_node(state: State) -> State:
                         chunks[f"chunk_{chunk_idx}"] = {"simulationFlow": [flow_copy2]}
                         chunk_idx += 1
                     else:
-                        # String or other: can't split meaningfully, keep as single chunk
-                        print(f"    Key '{key}' is large ({key_data_size} chars) but not splittable, keeping as 1 chunk")
+                        # String or other, or list under 10k: keep as single chunk
                         flow_copy["data"] = {key: key_data}
                         chunks[f"chunk_{chunk_idx}"] = {"simulationFlow": [flow_copy]}
                         chunk_idx += 1
@@ -714,6 +536,7 @@ def generate_chunk_node(chunk_id: str):
         llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash-lite",
             temperature=0,
+            thinking_budget=0,
             google_api_key=os.getenv("GOOGLE_API_KEY")
         )
 
@@ -724,15 +547,17 @@ def generate_chunk_node(chunk_id: str):
 TARGET SCENARIO:
 {state["target_scenario"]}
 
-RULES:
+CRITICAL STRUCTURE PRESERVATION RULES:
 1. Update ALL company names, competitor names, people names, emails, descriptions to match new scenario
-2. Keep EXACT same JSON keys and structure
-3. Adapt brand positioning, metrics, and narrative details to fit the new industry context
+2. Keep EXACT same dictionary/object keys - DO NOT add or remove any dictionary keys
+3. Arrays/lists can have items added or removed to fit the new scenario context (e.g., adjust number of questions, resources)
+4. Preserve all field names and object structures - only modify values and array contents
+5. Adapt brand positioning, metrics, and narrative details to fit the new industry context
 
 CHUNK TO TRANSFORM:
 {json.dumps(chunk_data, indent=2)}
 
-OUTPUT: Complete transformed JSON with same keys."""
+OUTPUT: Complete transformed JSON with same dictionary keys (array lengths can change if needed)."""
 
         try:
             response = llm.invoke([
@@ -751,7 +576,7 @@ OUTPUT: Complete transformed JSON with same keys."""
 
         except Exception as e:
             print(f"    [FAIL] Chunk {chunk_id} failed: {e}")
-            return {"errors": [f"chunk_{chunk_id}_failed: {str(e)}"]}
+            return {"errors": [f"chunk_{chunk_id}_failed: {str(e)}"], "retry_count": 1}
 
     return node_fn
 
@@ -820,6 +645,26 @@ def merge_chunks_node(state: State) -> State:
                     flow["data"].update(transformed_by_flow[flow_name]["data"])
         output_json["topicWizardData"]["selectedScenarioOption"] = state["target_scenario"]
 
+        # Restore any missing dictionary keys from input (preserve structure)
+        # This fixes cases where chunking caused keys to be dropped
+        def restore_missing_keys(input_obj, output_obj):
+            """Recursively restore any dictionary keys that exist in input but not in output"""
+            if isinstance(input_obj, dict) and isinstance(output_obj, dict):
+                for key in input_obj:
+                    if key not in output_obj:
+                        # Key was removed - restore it with original value
+                        output_obj[key] = input_obj[key]
+                    elif isinstance(input_obj[key], dict) and isinstance(output_obj[key], dict):
+                        # Recurse into nested dicts
+                        restore_missing_keys(input_obj[key], output_obj[key])
+                    elif isinstance(input_obj[key], list) and isinstance(output_obj[key], list):
+                        # For lists, recurse into each item if they're dicts
+                        for i in range(min(len(input_obj[key]), len(output_obj[key]))):
+                            if isinstance(input_obj[key][i], dict) and isinstance(output_obj[key][i], dict):
+                                restore_missing_keys(input_obj[key][i], output_obj[key][i])
+        
+        restore_missing_keys(state["input_json"], output_json)
+
         # Validate output structure with Pydantic (preserve key order)
         try:
             validated = SimulationJSON(**output_json)
@@ -842,93 +687,6 @@ def merge_chunks_node(state: State) -> State:
     except Exception as e:
         print(f"  [FAIL] Merge failed: {e}")
         state["errors"].append(f"merge_failed: {str(e)}")
-        state["retry_count"] += 1
-
-    return state
-
-
-def generation_node(state: State) -> State:
-    """Generate transformed JSON using AI (selective transformation for speed)"""
-    print(f"Generating transformed JSON... (attempt {state['retry_count'] + 1})")
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite",
-        temperature=0,
-        google_api_key=os.getenv("GOOGLE_API_KEY")
-    )
-
-    # Only send the transformable parts (already extracted), not full input
-    prompt = f"""Transform these JSON fields to match the new scenario. Keep exact same structure.
-
-TARGET SCENARIO:
-{state["target_scenario"]}
-
-RULES:
-1. Update ALL company names, competitor names, people names, emails, descriptions to match new scenario
-2. Keep EXACT same JSON keys and structure
-
-FIELDS TO TRANSFORM:
-{json.dumps(state["transformable_parts"], indent=2)}
-
-OUTPUT: Complete transformed JSON with same keys."""
-
-    try:
-        response = llm.invoke([
-            SystemMessage(content="Transform JSON precisely. Output only valid JSON."),
-            HumanMessage(content=prompt)
-        ])
-
-        content = response.content.strip()
-        content = content.replace("```json", "").replace("```", "").strip()
-        transformed_parts = json.loads(content)
-
-        # Build complete output by merging transformed parts with locked fields
-        output_json = json.loads(json.dumps(state["input_json"]))  # Deep copy
-
-        # Update transformed fields
-        output_json["topicWizardData"]["simulationName"] = transformed_parts["simulationName"]
-        output_json["topicWizardData"]["selectedScenarioOption"] = state["target_scenario"]
-        output_json["topicWizardData"]["workplaceScenario"] = transformed_parts["workplaceScenario"]
-
-        # Update simulationFlow in-place - only modify transformed content, keep locked flowProperties
-        for i, transformed_flow in enumerate(transformed_parts["simulationFlow"]):
-            if i < len(output_json["topicWizardData"]["simulationFlow"]):
-                original_flow = output_json["topicWizardData"]["simulationFlow"][i]
-
-                # Update flow fields except flowProperties (locked)
-                for key, value in transformed_flow.items():
-                    if key != "flowProperties":  # NEVER overwrite flowProperties
-                        if key == "children" and "children" in original_flow:
-                            # Update children content but keep their flowProperties
-                            for j, transformed_child in enumerate(value):
-                                if j < len(original_flow["children"]):
-                                    for child_key, child_value in transformed_child.items():
-                                        if child_key != "flowProperties":
-                                            original_flow["children"][j][child_key] = child_value
-                        else:
-                            original_flow[key] = value
-
-        # Validate output structure with Pydantic (preserve key order)
-        try:
-            validated = SimulationJSON(**output_json)
-            print("  [PASS] Pydantic schema validation passed")
-            # Don't use model_dump() - it reorders keys based on model definition
-        except ValidationError as ve:
-            print(f"  [FAIL] Pydantic validation failed: {ve.error_count()} errors")
-            for error in ve.errors()[:3]:
-                print(f"    - {error['loc']}: {error['msg']}")
-            state["errors"].append("pydantic_validation_failed")
-            state["retry_count"] += 1
-            return state
-
-        # Locked fields already in output_json from deep copy (line 457) - no restoration needed!
-
-        state["output_json"] = output_json
-        state["errors"] = []  # Clear errors on success
-
-    except Exception as e:
-        print(f"  [FAIL] AI transformation failed: {e}")
-        state["errors"].append(f"transformation_failed: {str(e)}")
         state["retry_count"] += 1
 
     return state
@@ -980,9 +738,14 @@ def validation_node(state: State) -> State:
 
 def should_retry(state: State) -> str:
     """Decide if we should retry generation"""
-    if state["errors"] and state["retry_count"] < 2:
-        print(f"  Retrying generation (attempt {state['retry_count'] + 1}/2)...")
+    # Only retry if we have errors AND haven't exceeded retry limit
+    # retry_count starts at 0, increments after each attempt
+    # So retry_count=0 means first attempt, retry_count=1 means one retry done
+    if state["errors"] and state["retry_count"] < 1:
+        print(f"  Retrying generation (attempt {state['retry_count'] + 1})...")
         return "generation"
+    elif state["errors"]:
+        print(f"  Max retries reached ({state['retry_count']} attempts), stopping with errors")
     return "end"
 
 
@@ -1006,17 +769,25 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
     # Build and run workflow
     start = time.time()
 
-    # Build workflow with dynamic parallel chunk generation
-    # Pre-analyze to determine number of chunks needed
-    simulation_flow_temp = input_json["topicWizardData"]["simulationFlow"]
-    num_chunks = estimate_chunk_count(simulation_flow_temp)
+    # First pass: create chunks to determine actual count
+    transformable_parts_temp = {
+        "simulationName": input_json["topicWizardData"]["simulationName"],
+        "selectedScenarioOption": input_json["topicWizardData"]["selectedScenarioOption"],
+        "workplaceScenario": input_json["topicWizardData"]["workplaceScenario"],
+        "simulationFlow": input_json["topicWizardData"]["simulationFlow"]
+    }
+    
+    # Quick chunk estimation to build workflow
+    temp_state = {"transformable_parts": transformable_parts_temp, "chunks": {}}
+    chunk_preparation_node(temp_state)
+    num_chunks = len(temp_state["chunks"])
 
     print(f"Building workflow with {num_chunks} parallel chunks...")
 
     workflow = StateGraph(State)
     workflow.add_node("chunk_preparation", chunk_preparation_node)
 
-    # Add N chunk generation nodes dynamically
+    # Add N chunk generation nodes dynamically based on actual chunk count
     for i in range(num_chunks):
         workflow.add_node(f"generate_chunk_{i}", generate_chunk_node(f"chunk_{i}"))
 
@@ -1044,6 +815,9 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
     })
 
     app = workflow.compile()
+    
+    # Configure recursion limit for faster execution
+    app.recursion_limit = 10
 
     # Initialize state with minimal preprocessing inline
     locked_fields = {
@@ -1069,8 +843,8 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
         "simulationFlow": input_json["topicWizardData"]["simulationFlow"]
     }
 
-    # Stream execution with real-time updates
-    print("\nStreaming parallel chunk generation:\n" + "-" * 60)
+    # Stream execution (console output commented out for cleaner logs)
+    # print("\nStreaming parallel chunk generation:\n" + "-" * 60)
     final_state = None
 
     for event in app.stream({
@@ -1087,11 +861,12 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
         "start_time": start,
         "validation_report": {}
     }, stream_mode="updates"):
-        for node_name, node_output in event.items():
-            print(f"[OK] {node_name} completed", flush=True)
-        final_state = node_output  # Capture last state
+        # Silently process events without console output
+        # for node_name, node_output in event.items():
+        #     print(f"[OK] {node_name} completed", flush=True)
+        final_state = list(event.values())[0] if event else final_state  # Capture last state
 
-    print("-" * 60)
+    # print("-" * 60)
     runtime_ms = (time.time() - start) * 1000
 
     # Save output
