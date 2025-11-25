@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+output.json
+validation_report.json
+validation_report.md
+*.log
+.vscode/
+.idea/
