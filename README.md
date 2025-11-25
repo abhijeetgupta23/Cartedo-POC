@@ -84,6 +84,100 @@ This POC demonstrates **100% AI-driven JSON transformation** using **LangGraph**
 - **Recursion Limit**: 10 (prevents infinite loops)
 - **State Reducers**: `merge_dicts` for chunks, `operator.add` for errors
 
+### Parallel Chunking Strategy
+
+**Why Parallelization?**
+
+Without chunking, the entire 50KB JSON would be sent to Gemini in a single request:
+- **Sequential Approach**: ~80-90 seconds (LLM processes entire JSON at once)
+- **Bottleneck**: Large context requires more thinking time, even with fast models
+
+**With Parallel Chunking**: Break JSON into 18-22 chunks and process concurrently:
+- **Parallel Approach**: ~10-15 seconds (chunks processed simultaneously)
+- **Speedup**: **6x faster** than sequential processing
+- **Key Insight**: Paid API tier allows high concurrency - leverage it!
+
+The system achieves this dramatic latency reduction through intelligent parallel chunking:
+
+**Chunking Algorithm:**
+1. **Metadata Chunk** (Chunk 0): `simulationName` + `workplaceScenario` (always first)
+2. **Flow-Level Chunking**: Each `simulationFlow` item analyzed:
+   - **With Children**: Each child becomes separate chunk
+   - **Large Children** (>10k chars): Split into 2 chunks by data keys
+   - **Large Data Objects**: Split by data keys individually
+   - **Very Large Keys** (>15k chars): Dict split into 3 sub-chunks
+   - **Large Keys** (>8k chars): Dict split into 2 sub-chunks
+   - **Large Lists** (>10k chars): List split into 2 halves
+   - **Small Flows**: Keep as single chunk
+
+**Chunk Size Optimization:**
+- **Target**: 18-22 parallel chunks (sweet spot for paid Gemini API tier)
+- **Balance**: Enough parallelization to reduce latency without overhead
+- **Thresholds**: Tuned to prevent excessive splitting (40+ chunks adds overhead)
+
+**Example Chunk Distribution:**
+```
+Chunk 0:  Metadata + workplace (3,209 chars)
+Chunk 1:  Flow "Introduction" child 1 (555 chars)
+Chunk 2:  Flow "Task" child 1 (2,122 chars)
+Chunk 3:  Flow "Task" child 2 (523 chars)
+...
+Chunk 11: Flow "Task" resource data part 1 (6,000 chars)
+Chunk 12: Flow "Task" resource data part 2 (5,649 chars)
+...
+Total: 20 chunks processed in parallel → ~12 second total time
+```
+
+**Why This Works:**
+- **Concurrency**: 18-22 API calls execute simultaneously (paid tier)
+- **Load Balancing**: Chunks sized to finish around same time
+- **Fault Tolerance**: If chunk fails, original data restored during merge
+- **Minimal Overhead**: Graph construction + merge < 1 second
+
+**Chunk-to-JSON Mapping:**
+
+Each chunk contains a subset of the JSON with preserved structure:
+
+```python
+# Chunk 0 (metadata)
+{
+  "simulationName": "...",
+  "workplaceScenario": { ... }
+}
+
+# Chunk 1-N (simulationFlow chunks)
+{
+  "simulationFlow": [{
+    "name": "Task Flow",
+    "data": { "instructions": "..." }  # Partial data
+  }]
+}
+
+# Merge combines all chunks back into complete JSON
+output_json = {
+  "topicWizardData": {
+    "simulationName": transformed_chunk_0.simulationName,
+    "workplaceScenario": transformed_chunk_0.workplaceScenario,
+    "simulationFlow": [
+      merge(chunk_1, chunk_2, chunk_3, ...),
+      ...
+    ],
+    # Locked fields restored from input
+    "scenarioOptions": input.scenarioOptions,
+    ...
+  }
+}
+```
+
+**Parallel Execution Flow:**
+```
+Time 0s:    All 20 chunks sent to Gemini API simultaneously
+Time 10s:   Chunks 1-18 complete (small/medium chunks)
+Time 12s:   Chunks 19-20 complete (large chunks finish last)
+Time 12.5s: Merge combines all chunks + validates
+Time 13s:   Output written, reports generated
+```
+
 ## Setup
 
 ### Prerequisites
@@ -227,10 +321,11 @@ variety and speed of service.
 ### 100% AI-Based Approach
 
 **How It Works:**
-1. LLM receives entire input JSON + target scenario description
-2. LLM generates complete transformed JSON in one pass
-3. Python code force-restores locked fields (safety measure)
-4. Validation checks schema and locked field equality
+1. Each chunk sent to LLM with target scenario description
+2. LLM generates transformed chunk (preserving structure)
+3. Chunks merged and validated with Pydantic schema
+4. Locked fields force-restored from input (safety measure)
+5. Final validation checks schema and locked field equality
 
 **No Regex:**
 - All entity extraction: LLM
@@ -241,7 +336,25 @@ variety and speed of service.
 - Gemini 2.5 Flash has large context window
 - LLM understands semantic relationships
 - LLM can maintain JSON structure
+- **Pydantic validation** catches schema violations immediately
 - Python safety net ensures locked fields never change
+
+**Pydantic's Role:**
+```python
+class SimulationJSON(BaseModel):
+    topicWizardData: TopicWizardData
+    
+class TopicWizardData(BaseModel):
+    lessonInformation: LessonInformation
+    scenarioOptions: List[str]
+    simulationFlow: List[Dict[str, Any]]
+    # ... all fields with strict typing
+```
+
+- **Schema Enforcement**: Validates JSON structure matches expected shape
+- **Type Safety**: Ensures all fields have correct types (str, list, dict, etc.)
+- **Early Detection**: Catches malformed JSON before merge completes
+- **Fast Validation**: ~10ms overhead vs 10+ seconds saved from preventing retries
 
 ### LangGraph Benefits
 
