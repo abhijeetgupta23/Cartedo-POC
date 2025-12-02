@@ -389,6 +389,7 @@ class State(TypedDict):
     retry_count: int
     start_time: float
     validation_report: dict  # Store validation results
+    usage_metadata: Annotated[dict, merge_dicts]  # Store usage metadata from all chunks
 
 
 def chunk_preparation_node(state: State) -> State:
@@ -571,8 +572,12 @@ OUTPUT: Complete transformed JSON with same dictionary keys (array lengths can c
 
             print(f"    [PASS] Chunk {chunk_id} transformed")
 
-            # Return only the transformed_chunks update (reducer will merge)
-            return {"transformed_chunks": {chunk_id: transformed_chunk}}
+            # Return transformed chunk and usage metadata (reducers will merge)
+            usage_data = response.usage_metadata if hasattr(response, 'usage_metadata') else {}
+            return {
+                "transformed_chunks": {chunk_id: transformed_chunk},
+                "usage_metadata": {chunk_id: usage_data}
+            }
 
         except Exception as e:
             print(f"    [FAIL] Chunk {chunk_id} failed: {e}")
@@ -758,6 +763,8 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
     print(f"\nTransforming {input_path} to scenario {scenario_index}")
     print("="*60)
 
+    metadata_json = json.loads("{}")
+
     # Load input
     with open(input_path, 'r', encoding='utf-8') as f:
         input_json = json.load(f)
@@ -789,7 +796,9 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
 
     # Add N chunk generation nodes dynamically based on actual chunk count
     for i in range(num_chunks):
+        #chunk_data = generate_chunk_node(f"chunk_{i}")
         workflow.add_node(f"generate_chunk_{i}", generate_chunk_node(f"chunk_{i}"))
+        #metadata_json[f"generate_chunk_{i}_usage"] = chunk_data[1]
 
     workflow.add_node("merge_chunks", merge_chunks_node)
     workflow.add_node("validation", validation_node)
@@ -859,7 +868,8 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
         "errors": [],
         "retry_count": 0,
         "start_time": start,
-        "validation_report": {}
+        "validation_report": {},
+        "usage_metadata": {}
     }, stream_mode="updates"):
         # Silently process events without console output
         # for node_name, node_output in event.items():
@@ -877,6 +887,37 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
     logger.info("Generating comprehensive validation reports...")
     validation_report = generate_validation_reports(final_state, runtime_ms)
 
+    # Save usage metadata to JSON file
+    usage_metadata_output = {
+        "timestamp": datetime.now().isoformat(),
+        "runtime_ms": runtime_ms,
+        "total_chunks": len(final_state.get("usage_metadata", {})),
+        "chunks": {}
+    }
+
+    # Aggregate usage metadata from all chunks
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_total_tokens = 0
+
+    for chunk_id, metadata in final_state.get("usage_metadata", {}).items():
+        if metadata:
+            usage_metadata_output["chunks"][chunk_id] = metadata
+            total_input_tokens += metadata.get("input_tokens", 0)
+            total_output_tokens += metadata.get("output_tokens", 0)
+            total_total_tokens += metadata.get("total_tokens", 0)
+
+    usage_metadata_output["total_usage"] = {
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "total_tokens": total_total_tokens
+    }
+
+    with open("usage_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(usage_metadata_output, f, indent=2, ensure_ascii=False)
+
+    logger.info("✅ Usage metadata saved: usage_metadata.json")
+
     # Final summary
     print(f"\n{'='*60}")
     print(f"Complete in {runtime_ms:.0f}ms")
@@ -886,6 +927,7 @@ def run(input_path: str, scenario_index: int, output_path: str = "output.json"):
         print(f"Errors: {final_state['errors']}")
     print(f"Output: {output_path}")
     print(f"Validation reports: validation_report.json, validation_report.md")
+    print(f"Usage metadata: usage_metadata.json")
     print(f"{'='*60}\n")
 
 
